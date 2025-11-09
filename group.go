@@ -6,7 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+	"fmt"
+	"Lcache/singleflight"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,6 +20,19 @@ var ErrValueRequired = errors.New("value is required")
 // ErrGroupClosed 组已关闭错误
 var ErrGroupClosed = errors.New("cache group is closed")
 
+// Getter 加载键值的回调函数接口
+type Getter interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+}
+
+// GetterFunc 函数类型实现 Getter 接口
+type GetterFunc func(ctx context.Context, key string) ([]byte, error)
+
+// Get 实现 Getter 接口
+func (f GetterFunc) Get(ctx context.Context, key string) ([]byte, error) {
+	return f(ctx, key)
+}
+
 
 var (
 	groupsMu sync.RWMutex
@@ -27,7 +41,10 @@ var (
 
 type Group struct {
 	name       string
+	getter     Getter
 	mainCache  *Cache
+	peers      PeerPicker
+	loader     *singleflight.Group
 	expiration time.Duration // 缓存过期时间，0表示永不过期
 	closed     int32         // 原子变量，标记组是否已关闭
 	stats      groupStats    // 统计信息
@@ -44,10 +61,10 @@ type groupStats struct {
 	loadDuration int64 // 加载总耗时（纳秒）
 }
 
-func NewGroup(name string, cacheBytes int64, opts ...GroupOption) *Group {
-	// if getter == nil {
-	// 	panic("nil Getter")
-	// }
+func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption) *Group {
+	if getter == nil {
+		panic("nil Getter")
+	}
 
 	// 创建默认缓存选项
 	cacheOpts := DefaultCacheOptions()
@@ -55,9 +72,9 @@ func NewGroup(name string, cacheBytes int64, opts ...GroupOption) *Group {
 
 	g := &Group{
 		name:      name,
-		// getter:    getter,
+		getter:    getter,
 		mainCache: NewCache(cacheOpts),
-		// loader:    &singleflight.Group{},
+		loader:    &singleflight.Group{},
 	}
 
 	// 应用选项
@@ -128,7 +145,7 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	}
 
 	// 检查是否是从其他节点同步过来的请求
-	// isPeerRequest := ctx.Value("from_peer") != nil
+	isPeerRequest := ctx.Value("from_peer") != nil
 
 	// 创建缓存视图
 	view := ByteView{b: cloneBytes(value)}
@@ -141,9 +158,9 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	}
 
 	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
-	// if !isPeerRequest && g.peers != nil {
-	// 	go g.syncToPeers(ctx, "set", key, value)
-	// }
+	if !isPeerRequest && g.peers != nil {
+		go g.syncToPeers(ctx, "set", key, value)
+	}
 
 	return nil
 }
@@ -163,12 +180,12 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 	g.mainCache.Delete(key)
 
 	// 检查是否是从其他节点同步过来的请求
-	// isPeerRequest := ctx.Value("from_peer") != nil
+	isPeerRequest := ctx.Value("from_peer") != nil
 
 	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
-	// if !isPeerRequest && g.peers != nil {
-	// 	go g.syncToPeers(ctx, "delete", key, nil)
-	// }
+	if !isPeerRequest && g.peers != nil {
+		go g.syncToPeers(ctx, "delete", key, nil)
+	}
 
 	return nil
 }
@@ -278,5 +295,108 @@ func DestroyAllGroups() {
 		g.Close()
 		delete(groups, name)
 		logrus.Infof("LCache destroyed cache group [%s]", name)
+	}
+}
+
+func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
+	// 使用 singleflight 确保并发请求只加载一次
+	startTime := time.Now()
+	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+		return g.loadData(ctx, key)
+	})
+
+	// 记录加载时间
+	loadDuration := time.Since(startTime).Nanoseconds()
+	atomic.AddInt64(&g.stats.loadDuration, loadDuration)
+	atomic.AddInt64(&g.stats.loads, 1)
+
+	if err != nil {
+		atomic.AddInt64(&g.stats.loaderErrors, 1)
+		return ByteView{}, err
+	}
+
+	view := viewi.(ByteView)
+
+	// 设置到本地缓存
+	if g.expiration > 0 {
+		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
+	} else {
+		g.mainCache.Add(key, view)
+	}
+
+	return view, nil
+}
+
+// loadData 实际加载数据的方法
+func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err error) {
+	// 尝试从远程节点获取
+	if g.peers != nil {
+		peer, ok, isSelf := g.peers.PickPeer(key)
+		if ok && !isSelf {
+			value, err := g.getFromPeer(ctx, peer, key)
+			if err == nil {
+				atomic.AddInt64(&g.stats.peerHits, 1)
+				return value, nil
+			}
+
+			atomic.AddInt64(&g.stats.peerMisses, 1)
+			logrus.Warnf("[LCache] failed to get from peer: %v", err)
+		}
+	}
+
+	// 从数据源加载
+	bytes, err := g.getter.Get(ctx, key)
+	if err != nil {
+		return ByteView{}, fmt.Errorf("failed to get data: %w", err)
+	}
+
+	atomic.AddInt64(&g.stats.loaderHits, 1)
+	return ByteView{b: cloneBytes(bytes)}, nil
+}
+
+// getFromPeer 从其他节点获取数据
+func (g *Group) getFromPeer(ctx context.Context, peer Peer, key string) (ByteView, error) {
+	bytes, err := peer.Get(g.name, key)
+	if err != nil {
+		return ByteView{}, fmt.Errorf("failed to get from peer: %w", err)
+	}
+	return ByteView{b: bytes}, nil
+}
+
+// RegisterPeers 注册PeerPicker
+func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.peers != nil {
+		panic("RegisterPeers called more than once")
+	}
+	g.peers = peers
+	logrus.Infof("[LCache] registered peers for group [%s]", g.name)
+}
+
+
+// syncToPeers 同步操作到其他节点
+func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []byte) {
+	if g.peers == nil {
+		return
+	}
+
+	// 选择对等节点
+	peer, ok, isSelf := g.peers.PickPeer(key)
+	if !ok || isSelf {
+		return
+	}
+
+	// 创建同步请求上下文
+	syncCtx := context.WithValue(context.Background(), "from_peer", true)
+
+	var err error
+	switch op {
+	case "set":
+		err = peer.Set(syncCtx, g.name, key, value)
+	case "delete":
+		_, err = peer.Delete(g.name, key)
+	}
+
+	if err != nil {
+		logrus.Errorf("[LCache] failed to sync %s to peer: %v", op, err)
 	}
 }
